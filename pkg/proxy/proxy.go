@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid"
@@ -20,7 +21,12 @@ import (
 )
 
 //nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+var (
+	ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
+	// ulidEntropyMu guards ulidEntropy: math/rand.Rand is not safe for
+	// concurrent use, and request IDs are generated from many goroutines.
+	ulidEntropyMu sync.Mutex
+)
 
 type contextKey int
 
@@ -95,11 +101,40 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
-	ctx := context.WithValue(r.Context(), reqIDKey, reqID)
+	ctx := context.WithValue(r.Context(), reqIDKey, NewRequestID())
 	*r = *r.WithContext(ctx)
 
 	p.handler.ServeHTTP(w, r)
+}
+
+// NewRequestID returns a new unique request ID.
+func NewRequestID() ulid.ULID {
+	ulidEntropyMu.Lock()
+	defer ulidEntropyMu.Unlock()
+
+	return ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+}
+
+// RequestIDHeader is the HTTP header used to propagate the request ID to
+// clients and downstream services.
+const RequestIDHeader = "X-Request-Id"
+
+// RequestIDMiddleware is HTTP middleware that guarantees the request context
+// carries a request ID. If the incoming request already has one (e.g. set by
+// the proxy layer), it is kept, so the ID stays correlated across layers.
+// The ID is also exposed to clients via the X-Request-Id response header.
+func RequestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID, ok := RequestIDFromContext(r.Context())
+		if !ok {
+			reqID = NewRequestID()
+			*r = *r.WithContext(WithRequestID(r.Context(), reqID))
+		}
+
+		w.Header().Set(RequestIDHeader, reqID.String())
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (p *Proxy) UseRequestModifier(fn ...RequestModifyMiddleware) {

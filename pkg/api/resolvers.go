@@ -3,12 +3,10 @@ package api
 //go:generate go run github.com/99designs/gqlgen
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"regexp"
 	"sort"
@@ -19,6 +17,8 @@ import (
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
 	"github.com/dstotijn/hetty/pkg/filter"
+	"github.com/dstotijn/hetty/pkg/httputil"
+	"github.com/dstotijn/hetty/pkg/log"
 	"github.com/dstotijn/hetty/pkg/proj"
 	"github.com/dstotijn/hetty/pkg/proxy"
 	"github.com/dstotijn/hetty/pkg/proxy/intercept"
@@ -44,6 +44,7 @@ type Resolver struct {
 	RequestLogService *reqlog.Service
 	InterceptService  *intercept.Service
 	SenderService     *sender.Service
+	Logger            log.Logger
 }
 
 type (
@@ -53,6 +54,26 @@ type (
 
 func (r *Resolver) Query() QueryResolver       { return &queryResolver{r} }
 func (r *Resolver) Mutation() MutationResolver { return &mutationResolver{r} }
+
+// auditLog writes an audit log entry for a (mutating) GraphQL operation. The
+// request ID from the context (set by the API or proxy layer) is included so
+// audit entries can be correlated with access logs and proxy logs.
+func (r *Resolver) auditLog(ctx context.Context, action string, keysAndValues ...interface{}) {
+	if r.Logger == nil {
+		return
+	}
+
+	fields := make([]interface{}, 0, len(keysAndValues)+4)
+	fields = append(fields, "action", action)
+
+	if reqID, ok := proxy.RequestIDFromContext(ctx); ok {
+		fields = append(fields, "request_id", reqID.String())
+	}
+
+	fields = append(fields, keysAndValues...)
+
+	r.Logger.Infow("Audit log.", fields...)
+}
 
 func (r *queryResolver) HTTPRequestLogs(ctx context.Context) ([]HTTPRequestLog, error) {
 	reqs, err := r.RequestLogService.FindRequests(ctx)
@@ -183,6 +204,8 @@ func parseResponseLog(resLog reqlog.ResponseLog) (HTTPResponseLog, error) {
 }
 
 func (r *mutationResolver) CreateProject(ctx context.Context, name string) (*Project, error) {
+	r.auditLog(ctx, "create_project", "name", name)
+
 	p, err := r.ProjectService.CreateProject(ctx, name)
 	if errors.Is(err, proj.ErrInvalidName) {
 		return nil, gqlerror.Errorf("Project name must only contain alphanumeric or space chars.")
@@ -196,6 +219,8 @@ func (r *mutationResolver) CreateProject(ctx context.Context, name string) (*Pro
 }
 
 func (r *mutationResolver) OpenProject(ctx context.Context, id ulid.ULID) (*Project, error) {
+	r.auditLog(ctx, "open_project", "project_id", id.String())
+
 	p, err := r.ProjectService.OpenProject(ctx, id)
 	if errors.Is(err, proj.ErrInvalidName) {
 		return nil, gqlerror.Errorf("Project name must only contain alphanumeric or space chars.")
@@ -251,6 +276,8 @@ func regexpToStringPtr(r *regexp.Regexp) *string {
 }
 
 func (r *mutationResolver) CloseProject(ctx context.Context) (*CloseProjectResult, error) {
+	r.auditLog(ctx, "close_project")
+
 	if err := r.ProjectService.CloseProject(); err != nil {
 		return nil, fmt.Errorf("could not close project: %w", err)
 	}
@@ -259,6 +286,8 @@ func (r *mutationResolver) CloseProject(ctx context.Context) (*CloseProjectResul
 }
 
 func (r *mutationResolver) DeleteProject(ctx context.Context, id ulid.ULID) (*DeleteProjectResult, error) {
+	r.auditLog(ctx, "delete_project", "project_id", id.String())
+
 	if err := r.ProjectService.DeleteProject(ctx, id); err != nil {
 		return nil, fmt.Errorf("could not delete project: %w", err)
 	}
@@ -269,6 +298,8 @@ func (r *mutationResolver) DeleteProject(ctx context.Context, id ulid.ULID) (*De
 }
 
 func (r *mutationResolver) ClearHTTPRequestLog(ctx context.Context) (*ClearHTTPRequestLogResult, error) {
+	r.auditLog(ctx, "clear_http_request_log")
+
 	project, err := r.ProjectService.ActiveProject(ctx)
 	if errors.Is(err, proj.ErrNoProject) {
 		return nil, noActiveProjectErr(ctx)
@@ -284,6 +315,8 @@ func (r *mutationResolver) ClearHTTPRequestLog(ctx context.Context) (*ClearHTTPR
 }
 
 func (r *mutationResolver) SetScope(ctx context.Context, input []ScopeRuleInput) ([]ScopeRule, error) {
+	r.auditLog(ctx, "set_scope", "rule_count", len(input))
+
 	rules := make([]scope.Rule, len(input))
 
 	for i, rule := range input {
@@ -337,6 +370,8 @@ func (r *mutationResolver) SetHTTPRequestLogFilter(
 	ctx context.Context,
 	input *HTTPRequestLogFilterInput,
 ) (*HTTPRequestLogFilter, error) {
+	r.auditLog(ctx, "set_http_request_log_filter")
+
 	filter, err := findRequestsFilterFromInput(input)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse request log filter: %w", err)
@@ -394,6 +429,8 @@ func (r *mutationResolver) SetSenderRequestFilter(
 	ctx context.Context,
 	input *SenderRequestFilterInput,
 ) (*SenderRequestFilter, error) {
+	r.auditLog(ctx, "set_sender_request_filter")
+
 	filter, err := findSenderRequestsFilterFromInput(input)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse request log filter: %w", err)
@@ -413,6 +450,8 @@ func (r *mutationResolver) CreateOrUpdateSenderRequest(
 	ctx context.Context,
 	input SenderRequestInput,
 ) (*SenderRequest, error) {
+	r.auditLog(ctx, "create_or_update_sender_request", "url", input.URL)
+
 	req := sender.Request{
 		URL:    input.URL,
 		Header: make(http.Header),
@@ -457,6 +496,8 @@ func (r *mutationResolver) CreateSenderRequestFromHTTPRequestLog(
 	ctx context.Context,
 	id ulid.ULID,
 ) (*SenderRequest, error) {
+	r.auditLog(ctx, "create_sender_request_from_http_request_log", "request_log_id", id.String())
+
 	req, err := r.SenderService.CloneFromRequestLog(ctx, id)
 	if errors.Is(err, proj.ErrNoProject) {
 		return nil, noActiveProjectErr(ctx)
@@ -473,10 +514,18 @@ func (r *mutationResolver) CreateSenderRequestFromHTTPRequestLog(
 }
 
 func (r *mutationResolver) SendRequest(ctx context.Context, id ulid.ULID) (*SenderRequest, error) {
+	r.auditLog(ctx, "send_request", "sender_request_id", id.String())
+
 	// Use new context, because we don't want to risk interrupting sending the request
 	// or the subsequent storing of the response, e.g. if ctx gets cancelled or
 	// times out.
 	ctx2 := context.Background()
+
+	// Propagate the request ID to the detached context, so logs emitted
+	// while sending stay correlated with this GraphQL operation.
+	if reqID, ok := proxy.RequestIDFromContext(ctx); ok {
+		ctx2 = proxy.WithRequestID(ctx2, reqID)
+	}
 
 	var sendErr *sender.SendError
 
@@ -507,6 +556,8 @@ func (r *mutationResolver) SendRequest(ctx context.Context, id ulid.ULID) (*Send
 }
 
 func (r *mutationResolver) DeleteSenderRequests(ctx context.Context) (*DeleteSenderRequestsResult, error) {
+	r.auditLog(ctx, "delete_sender_requests")
+
 	project, err := r.ProjectService.ActiveProject(ctx)
 	if errors.Is(err, proj.ErrNoProject) {
 		return nil, noActiveProjectErr(ctx)
@@ -553,6 +604,8 @@ func (r *queryResolver) InterceptedRequest(ctx context.Context, id ulid.ULID) (*
 }
 
 func (r *mutationResolver) ModifyRequest(ctx context.Context, input ModifyRequestInput) (*ModifyRequestResult, error) {
+	r.auditLog(ctx, "modify_request", "intercepted_request_id", input.ID.String())
+
 	body := ""
 	if input.Body != nil {
 		body = *input.Body
@@ -577,6 +630,8 @@ func (r *mutationResolver) ModifyRequest(ctx context.Context, input ModifyReques
 }
 
 func (r *mutationResolver) CancelRequest(ctx context.Context, id ulid.ULID) (*CancelRequestResult, error) {
+	r.auditLog(ctx, "cancel_request", "intercepted_request_id", id.String())
+
 	err := r.InterceptService.CancelRequest(id)
 	if err != nil {
 		return nil, fmt.Errorf("could not cancel http request: %w", err)
@@ -589,6 +644,8 @@ func (r *mutationResolver) ModifyResponse(
 	ctx context.Context,
 	input ModifyResponseInput,
 ) (*ModifyResponseResult, error) {
+	r.auditLog(ctx, "modify_response", "intercepted_request_id", input.RequestID.String())
+
 	res := &http.Response{
 		Header:     make(http.Header),
 		Status:     fmt.Sprintf("%v %v", input.StatusCode, input.StatusReason),
@@ -621,6 +678,8 @@ func (r *mutationResolver) ModifyResponse(
 }
 
 func (r *mutationResolver) CancelResponse(ctx context.Context, requestID ulid.ULID) (*CancelResponseResult, error) {
+	r.auditLog(ctx, "cancel_response", "intercepted_request_id", requestID.String())
+
 	err := r.InterceptService.CancelResponse(requestID)
 	if err != nil {
 		return nil, fmt.Errorf("could not cancel http response: %w", err)
@@ -633,6 +692,10 @@ func (r *mutationResolver) UpdateInterceptSettings(
 	ctx context.Context,
 	input UpdateInterceptSettingsInput,
 ) (*InterceptSettings, error) {
+	r.auditLog(ctx, "update_intercept_settings",
+		"requests_enabled", input.RequestsEnabled,
+		"responses_enabled", input.ResponsesEnabled)
+
 	settings := intercept.Settings{
 		RequestsEnabled:  input.RequestsEnabled,
 		ResponsesEnabled: input.ResponsesEnabled,
@@ -777,12 +840,15 @@ func parseHTTPRequest(req *http.Request) (HTTPRequest, error) {
 	}
 
 	if req.Body != nil {
-		body, err := ioutil.ReadAll(req.Body)
+		// ReadAndRestoreBody bounds the amount of memory used, always closes
+		// the original body (even when the client disconnects mid-read), and
+		// hands back a restored body for downstream consumers.
+		body, restored, err := httputil.ReadAndRestoreBody(req.Body, httputil.DefaultMaxBodySize)
 		if err != nil {
 			return HTTPRequest{}, fmt.Errorf("failed to read request body: %w", err)
 		}
 
-		req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		req.Body = restored
 		bodyStr := string(body)
 		httpReq.Body = &bodyStr
 	}
@@ -829,12 +895,12 @@ func parseHTTPResponse(res *http.Response) (HTTPResponse, error) {
 	}
 
 	if res.Body != nil {
-		body, err := ioutil.ReadAll(res.Body)
+		body, restored, err := httputil.ReadAndRestoreBody(res.Body, httputil.DefaultMaxBodySize)
 		if err != nil {
 			return HTTPResponse{}, fmt.Errorf("failed to read response body: %w", err)
 		}
 
-		res.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		res.Body = restored
 		bodyStr := string(body)
 		httpRes.Body = &bodyStr
 	}

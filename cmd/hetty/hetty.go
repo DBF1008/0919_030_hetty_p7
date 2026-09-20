@@ -211,6 +211,12 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	}
 
 	adminHandler := http.FileServer(http.FS(fsSub))
+
+	// SkipClean(true) disables mux's default path cleaning, which would
+	// otherwise redirect requests with "unclean" paths (dot segments,
+	// repeated slashes, encoded characters). This router also serves
+	// proxied requests whose RequestURI must be forwarded verbatim, so
+	// cleaning must not rewrite or redirect them.
 	router := mux.NewRouter().SkipClean(true)
 	adminRouter := router.MatcherFunc(func(req *http.Request, match *mux.RouteMatch) bool {
 		hostname, _ := os.Hostname()
@@ -228,14 +234,19 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 			req.Host == fmt.Sprintf("%v:%v", listenHost, listenPort) ||
 			req.Method != http.MethodConnect && !strings.HasPrefix(req.RequestURI, "http://")
 	}).Subrouter().StrictSlash(true)
+	// Note: StrictSlash(true) makes routes registered with a trailing slash
+	// (e.g. the GraphQL endpoint) also match the slash-less variant via a
+	// redirect, so both forms keep working.
 
 	// GraphQL server.
 	gqlEndpoint := "/api/graphql/"
+	gqlLogger := cmd.config.logger.Named("graphql").Sugar()
 	adminRouter.Path(gqlEndpoint).Handler(api.HTTPHandler(&api.Resolver{
 		ProjectService:    projService,
 		RequestLogService: reqLogService,
 		InterceptService:  interceptService,
 		SenderService:     senderService,
+		Logger:            gqlLogger,
 	}, gqlEndpoint))
 
 	// Admin interface.
