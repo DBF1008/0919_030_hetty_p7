@@ -15,6 +15,7 @@ import (
 
 	"github.com/dstotijn/hetty/pkg/proxy"
 	"github.com/dstotijn/hetty/pkg/proxy/intercept"
+	"github.com/dstotijn/hetty/pkg/reqid"
 )
 
 //nolint:gosec
@@ -57,7 +58,7 @@ func TestRequestModifier(t *testing.T) {
 		req := httptest.NewRequest("GET", "https://example.com/foo", nil)
 		reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
 		*req = *req.WithContext(ctx)
-		*req = *req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+		*req = *req.WithContext(reqid.ContextWithID(req.Context(), reqID))
 
 		next := func(req *http.Request) {}
 		go svc.RequestModifier(next)(req)
@@ -83,7 +84,7 @@ func TestRequestModifier(t *testing.T) {
 		req.Header.Set("X-Foo", "foo")
 
 		reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
-		*req = *req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+		*req = *req.WithContext(reqid.ContextWithID(req.Context(), reqID))
 
 		modReq := req.Clone(context.Background())
 		modReq.Header.Set("X-Foo", "bar")
@@ -167,7 +168,7 @@ func TestResponseModifier(t *testing.T) {
 		req := httptest.NewRequest("GET", "https://example.com/foo", nil)
 		reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
 		*req = *req.WithContext(ctx)
-		*req = *req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+		*req = *req.WithContext(reqid.ContextWithID(req.Context(), reqID))
 
 		res := &http.Response{
 			Request: req,
@@ -213,7 +214,7 @@ func TestResponseModifier(t *testing.T) {
 		req.Header.Set("X-Foo", "foo")
 
 		reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
-		*req = *req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+		*req = *req.WithContext(reqid.ContextWithID(req.Context(), reqID))
 
 		res := &http.Response{
 			Request: req,

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/chromedp/chromedp"
 	"github.com/gorilla/mux"
@@ -28,6 +29,7 @@ import (
 	"github.com/dstotijn/hetty/pkg/proj"
 	"github.com/dstotijn/hetty/pkg/proxy"
 	"github.com/dstotijn/hetty/pkg/proxy/intercept"
+	"github.com/dstotijn/hetty/pkg/reqid"
 	"github.com/dstotijn/hetty/pkg/reqlog"
 	"github.com/dstotijn/hetty/pkg/scope"
 	"github.com/dstotijn/hetty/pkg/sender"
@@ -211,7 +213,16 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	}
 
 	adminHandler := http.FileServer(http.FS(fsSub))
+	// SkipClean(true) disables gorilla/mux's default request path cleaning
+	// (e.g. /foo/../bar -> /bar). It MUST stay enabled: the catch-all route
+	// is the MITM proxy, which must proxy paths exactly as the client sent
+	// them. Cleaning them here would corrupt upstream URLs. Do not remove
+	// without auditing both proxying and admin route matching.
 	router := mux.NewRouter().SkipClean(true)
+	// The request ID middleware runs on the outermost router so every
+	// request — admin API, static assets and proxied traffic handled below
+	// — carries a correlation ID on its context and response header.
+	router.Use(reqid.Middleware)
 	adminRouter := router.MatcherFunc(func(req *http.Request, match *mux.RouteMatch) bool {
 		hostname, _ := os.Hostname()
 		host, _, _ := net.SplitHostPort(req.Host)
@@ -228,15 +239,28 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 			req.Host == fmt.Sprintf("%v:%v", listenHost, listenPort) ||
 			req.Method != http.MethodConnect && !strings.HasPrefix(req.RequestURI, "http://")
 	}).Subrouter().StrictSlash(true)
+	// StrictSlash(true) applies ONLY to the admin subrouter: it redirects
+	// "/api/graphql" -> "/api/graphql/" so the documented trailing-slash
+	// endpoint is reached regardless of how the client types it, while the
+	// underlying proxy routes remain untouched. Keep it scoped to this
+	// subrouter for that reason.
 
-	// GraphQL server.
+	// GraphQL server. The handler itself applies request size limiting,
+	// per-client rate limiting, query complexity limiting and per-operation
+	// audit logging on top of the router-wide request ID middleware.
 	gqlEndpoint := "/api/graphql/"
+	// One audit logger is shared by the gqlgen operation audit extension
+	// (every operation) and the resolver-level mutation audit entries
+	// (ModifyRequest, SendRequest, ...), so all entries are correlated by
+	// request_id under the same logger name.
+	auditLogger := cmd.config.logger.Named("audit").Sugar()
 	adminRouter.Path(gqlEndpoint).Handler(api.HTTPHandler(&api.Resolver{
 		ProjectService:    projService,
 		RequestLogService: reqLogService,
 		InterceptService:  interceptService,
 		SenderService:     senderService,
-	}, gqlEndpoint))
+		Logger:            auditLogger,
+	}, gqlEndpoint, api.WithLogger(auditLogger)))
 
 	// Admin interface.
 	adminRouter.PathPrefix("").Handler(adminHandler)
@@ -245,7 +269,15 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	router.PathPrefix("").Handler(proxy)
 
 	httpServer := &http.Server{
-		Addr:         cmd.addr,
+		Addr: cmd.addr,
+		// ReadHeaderTimeout bounds slowloris-style clients that hold a
+		// connection open while trickling headers. ReadTimeout/WriteTimeout
+		// are deliberately NOT set: long lived CONNECT tunnels, intercepted
+		// requests and long running sender responses must not be cut off.
+		ReadHeaderTimeout: 10 * time.Second,
+		// IdleTimeout caps keep-alive idle time (the zero value would inherit
+		// ReadHeaderTimeout, but we set it explicitly for clarity).
+		IdleTimeout:  90 * time.Second,
 		Handler:      router,
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}, // Disable HTTP/2
 		ErrorLog:     zap.NewStdLog(cmd.config.logger.Named("http")),

@@ -15,6 +15,7 @@ import (
 	"github.com/dstotijn/hetty/pkg/filter"
 	"github.com/dstotijn/hetty/pkg/log"
 	"github.com/dstotijn/hetty/pkg/proxy"
+	"github.com/dstotijn/hetty/pkg/reqid"
 	"github.com/dstotijn/hetty/pkg/scope"
 )
 
@@ -155,7 +156,7 @@ func (svc *Service) RequestModifier(next proxy.RequestModifyFunc) proxy.RequestM
 			return
 		}
 
-		reqID, ok := proxy.RequestIDFromContext(req.Context())
+		reqID, ok := reqid.FromContext(req.Context())
 		if !ok {
 			svc.logger.Errorw("Bypassed logging: request doesn't have an ID.")
 			return

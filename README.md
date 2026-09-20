@@ -121,6 +121,32 @@ Visit https://hetty.xyz to learn more about Hetty.
 
 📖 [Read the docs](https://hetty.xyz/docs)
 
+## Request tracking & GraphQL protection
+
+The admin GraphQL endpoint ships with a defense-in-depth middleware stack
+(see `pkg/api/http.go`):
+
+- **Request ID propagation**: every request (GraphQL, admin assets and
+  proxied traffic) gets a ULID-based correlation ID via `pkg/reqid`. It is
+  carried on the request context, echoed in the `X-Request-ID` response
+  header, attached to GraphQL error `extensions.request_id`, and threaded into
+  audit and proxy logs. An inbound `X-Request-ID` header is honored when it is
+  a valid ULID.
+- **Query complexity limit**: overly deep/expensive GraphQL queries are
+  rejected before execution (default cost `2000`, configurable through
+  `api.WithComplexityLimit`).
+- **Rate limiting**: a per-client-IP token bucket throttles request volume
+  (default 10 rps, burst 20; `api.WithRateLimiter`). `X-Forwarded-For` is
+  only used as the key when `api.WithTrustProxyHeader()` is set.
+- **Request size limit**: GraphQL request bodies are capped at 1 MiB
+  (`api.WithMaxQueryBytes`).
+- **Audit logging**: each executed operation logs request ID, type/name, root
+  fields and latency; state changing mutations (`ModifyRequest`,
+  `SendRequest`, `ModifyResponse`, cancellations) log additional entity IDs.
+- **Safe body reads**: intercepted request/response bodies are buffered with a
+  bounded (10 MiB), context-aware reader (`pkg/httpio`) that aborts when the
+  peer disconnects, preventing unbounded memory growth.
+
 ## Support
 
 Use [issues](https://github.com/dstotijn/hetty/issues) for bug reports and

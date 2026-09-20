@@ -3,25 +3,26 @@ package api
 //go:generate go run github.com/99designs/gqlgen
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/99designs/gqlgen/graphql"
 	"github.com/oklog/ulid"
 	"github.com/vektah/gqlparser/v2/gqlerror"
 
 	"github.com/dstotijn/hetty/pkg/filter"
+	"github.com/dstotijn/hetty/pkg/httpio"
+	"github.com/dstotijn/hetty/pkg/log"
 	"github.com/dstotijn/hetty/pkg/proj"
-	"github.com/dstotijn/hetty/pkg/proxy"
 	"github.com/dstotijn/hetty/pkg/proxy/intercept"
+	"github.com/dstotijn/hetty/pkg/reqid"
 	"github.com/dstotijn/hetty/pkg/reqlog"
 	"github.com/dstotijn/hetty/pkg/scope"
 	"github.com/dstotijn/hetty/pkg/sender"
@@ -44,6 +45,19 @@ type Resolver struct {
 	RequestLogService *reqlog.Service
 	InterceptService  *intercept.Service
 	SenderService     *sender.Service
+	// Logger receives audit entries for state changing mutations
+	// (ModifyRequest, SendRequest, project changes, ...). When nil the
+	// gqlgen-level operation audit log still runs (see audit.go).
+	Logger log.Logger
+}
+
+// auditLogger returns the configured audit logger, or a no-op logger.
+func (r *Resolver) auditLogger() log.Logger {
+	if r.Logger == nil {
+		return log.NewNopLogger()
+	}
+
+	return r.Logger
 }
 
 type (
@@ -475,8 +489,14 @@ func (r *mutationResolver) CreateSenderRequestFromHTTPRequestLog(
 func (r *mutationResolver) SendRequest(ctx context.Context, id ulid.ULID) (*SenderRequest, error) {
 	// Use new context, because we don't want to risk interrupting sending the request
 	// or the subsequent storing of the response, e.g. if ctx gets cancelled or
-	// times out.
+	// times out. The correlation ID is explicitly propagated so the sender
+	// service and audit logs remain traceable to the originating request.
 	ctx2 := context.Background()
+	if reqID, ok := reqid.FromContext(ctx); ok {
+		ctx2 = reqid.ContextWithID(ctx2, reqID)
+	}
+
+	start := time.Now()
 
 	var sendErr *sender.SendError
 
@@ -487,6 +507,12 @@ func (r *mutationResolver) SendRequest(ctx context.Context, id ulid.ULID) (*Send
 	case errors.Is(err, proj.ErrNoProject):
 		return nil, noActiveProjectErr(ctx)
 	case errors.As(err, &sendErr):
+		r.auditLogger().Errorw("Audit: send request failed.",
+			"request_id", auditRequestID(ctx),
+			"sender_request_id", id.String(),
+			"latency_ms", time.Since(start).Milliseconds(),
+			"error", sendErr.Unwrap().Error())
+
 		return nil, &gqlerror.Error{
 			Path:    graphql.GetPath(ctx),
 			Message: fmt.Sprintf("Sending request failed: %v", sendErr.Unwrap()),
@@ -495,8 +521,19 @@ func (r *mutationResolver) SendRequest(ctx context.Context, id ulid.ULID) (*Send
 			},
 		}
 	case err != nil:
+		r.auditLogger().Errorw("Audit: send request failed.",
+			"request_id", auditRequestID(ctx),
+			"sender_request_id", id.String(),
+			"latency_ms", time.Since(start).Milliseconds(),
+			"error", err.Error())
+
 		return nil, fmt.Errorf("could not send request: %w", err)
 	}
+
+	r.auditLogger().Infow("Audit: send request.",
+		"request_id", auditRequestID(ctx),
+		"sender_request_id", id.String(),
+		"latency_ms", time.Since(start).Milliseconds())
 
 	senderReq, err := parseSenderRequest(req)
 	if err != nil {
@@ -504,6 +541,16 @@ func (r *mutationResolver) SendRequest(ctx context.Context, id ulid.ULID) (*Send
 	}
 
 	return &senderReq, nil
+}
+
+// auditRequestID returns the request ID carried by ctx as a string, or "-"
+// when absent, so audit entries always have a stable field shape.
+func auditRequestID(ctx context.Context) string {
+	if id, ok := reqid.FromContext(ctx); ok {
+		return id.String()
+	}
+
+	return "-"
 }
 
 func (r *mutationResolver) DeleteSenderRequests(ctx context.Context) (*DeleteSenderRequestsResult, error) {
@@ -570,8 +617,20 @@ func (r *mutationResolver) ModifyRequest(ctx context.Context, input ModifyReques
 
 	err = r.InterceptService.ModifyRequest(input.ID, req, input.ModifyResponse)
 	if err != nil {
+		r.auditLogger().Errorw("Audit: modify request failed.",
+			"request_id", auditRequestID(ctx),
+			"intercepted_request_id", input.ID.String(),
+			"error", err.Error())
+
 		return nil, fmt.Errorf("could not modify http request: %w", err)
 	}
+
+	r.auditLogger().Infow("Audit: modify request.",
+		"request_id", auditRequestID(ctx),
+		"intercepted_request_id", input.ID.String(),
+		"method", input.Method.String(),
+		"url", input.URL.String(),
+		"modify_response", input.ModifyResponse)
 
 	return &ModifyRequestResult{Success: true}, nil
 }
@@ -581,6 +640,10 @@ func (r *mutationResolver) CancelRequest(ctx context.Context, id ulid.ULID) (*Ca
 	if err != nil {
 		return nil, fmt.Errorf("could not cancel http request: %w", err)
 	}
+
+	r.auditLogger().Infow("Audit: cancel request.",
+		"request_id", auditRequestID(ctx),
+		"intercepted_request_id", id.String())
 
 	return &CancelRequestResult{Success: true}, nil
 }
@@ -614,8 +677,18 @@ func (r *mutationResolver) ModifyResponse(
 
 	err := r.InterceptService.ModifyResponse(input.RequestID, res)
 	if err != nil {
+		r.auditLogger().Errorw("Audit: modify response failed.",
+			"request_id", auditRequestID(ctx),
+			"intercepted_request_id", input.RequestID.String(),
+			"error", err.Error())
+
 		return nil, fmt.Errorf("could not modify http request: %w", err)
 	}
+
+	r.auditLogger().Infow("Audit: modify response.",
+		"request_id", auditRequestID(ctx),
+		"intercepted_request_id", input.RequestID.String(),
+		"status_code", input.StatusCode)
 
 	return &ModifyResponseResult{Success: true}, nil
 }
@@ -625,6 +698,10 @@ func (r *mutationResolver) CancelResponse(ctx context.Context, requestID ulid.UL
 	if err != nil {
 		return nil, fmt.Errorf("could not cancel http response: %w", err)
 	}
+
+	r.auditLogger().Infow("Audit: cancel response.",
+		"request_id", auditRequestID(ctx),
+		"intercepted_request_id", requestID.String())
 
 	return &CancelResponseResult{Success: true}, nil
 }
@@ -749,7 +826,7 @@ func parseHTTPRequest(req *http.Request) (HTTPRequest, error) {
 		return HTTPRequest{}, fmt.Errorf("http request has invalid protocol: %v", req.Proto)
 	}
 
-	id, ok := proxy.RequestIDFromContext(req.Context())
+	id, ok := reqid.FromContext(req.Context())
 	if !ok {
 		return HTTPRequest{}, errors.New("http request has missing ID")
 	}
@@ -777,12 +854,12 @@ func parseHTTPRequest(req *http.Request) (HTTPRequest, error) {
 	}
 
 	if req.Body != nil {
-		body, err := ioutil.ReadAll(req.Body)
+		body, restored, err := httpio.ReadAndRestoreBody(req.Context(), req.Body)
 		if err != nil {
 			return HTTPRequest{}, fmt.Errorf("failed to read request body: %w", err)
 		}
 
-		req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		req.Body = restored
 		bodyStr := string(body)
 		httpReq.Body = &bodyStr
 	}
@@ -796,7 +873,7 @@ func parseHTTPResponse(res *http.Response) (HTTPResponse, error) {
 		return HTTPResponse{}, fmt.Errorf("http response has invalid protocol: %v", res.Proto)
 	}
 
-	id, ok := proxy.RequestIDFromContext(res.Request.Context())
+	id, ok := reqid.FromContext(res.Request.Context())
 	if !ok {
 		return HTTPResponse{}, errors.New("http response has missing ID")
 	}
@@ -829,12 +906,12 @@ func parseHTTPResponse(res *http.Response) (HTTPResponse, error) {
 	}
 
 	if res.Body != nil {
-		body, err := ioutil.ReadAll(res.Body)
+		body, restored, err := httpio.ReadAndRestoreBody(res.Request.Context(), res.Body)
 		if err != nil {
 			return HTTPResponse{}, fmt.Errorf("failed to read response body: %w", err)
 		}
 
-		res.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+		res.Body = restored
 		bodyStr := string(body)
 		httpRes.Body = &bodyStr
 	}

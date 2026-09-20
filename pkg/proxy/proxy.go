@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,14 +16,8 @@ import (
 	"github.com/oklog/ulid"
 
 	"github.com/dstotijn/hetty/pkg/log"
+	"github.com/dstotijn/hetty/pkg/reqid"
 )
-
-//nolint:gosec
-var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
-
-type contextKey int
-
-const reqIDKey contextKey = 0
 
 // Proxy implements http.Handler and offers MITM behaviour for modifying
 // HTTP requests and responses.
@@ -95,9 +88,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
-	ctx := context.WithValue(r.Context(), reqIDKey, reqID)
-	*r = *r.WithContext(ctx)
+	// Ensure every proxied request carries a correlation ID. When the proxy
+	// is mounted behind reqid.Middleware (the normal wiring in cmd/hetty), the
+	// ID was already assigned there and any inbound X-Request-ID was honored;
+	// reuse it so a request has a single ID across its whole lifecycle. When
+	// the proxy is used standalone (e.g. tests), mint a fresh ID.
+	reqID, hasID := reqid.FromContext(r.Context())
+	if !hasID {
+		reqID = reqid.New()
+		r = r.WithContext(reqid.ContextWithID(r.Context(), reqID))
+	}
+
+	// Echo it back to the client for diagnostics.
+	w.Header().Set(reqid.HeaderName, reqID.String())
 
 	p.handler.ServeHTTP(w, r)
 }
@@ -164,13 +167,19 @@ func (p *Proxy) modifyResponse(res *http.Response) error {
 	return fn(res)
 }
 
+// WithRequestID stores a request ID on ctx.
+//
+// Deprecated: use reqid.ContextWithID. This wrapper is retained so external
+// callers and older code keep compiling.
 func WithRequestID(ctx context.Context, id ulid.ULID) context.Context {
-	return context.WithValue(ctx, reqIDKey, id)
+	return reqid.ContextWithID(ctx, id)
 }
 
+// RequestIDFromContext returns the request ID carried by ctx.
+//
+// Deprecated: use reqid.FromContext.
 func RequestIDFromContext(ctx context.Context) (ulid.ULID, bool) {
-	id, ok := ctx.Value(reqIDKey).(ulid.ULID)
-	return id, ok
+	return reqid.FromContext(ctx)
 }
 
 // handleConnect hijacks the incoming HTTP request and sets up an HTTP tunnel.
@@ -233,14 +242,19 @@ func (p *Proxy) clientTLSConn(conn net.Conn) (*tls.Conn, error) {
 }
 
 func (p *Proxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	reqID, _ := reqid.FromContext(r.Context())
+
 	switch {
 	case !errors.Is(err, context.Canceled):
 		p.logger.Errorw("Failed to proxy request.",
-			"error", err)
+			"error", err,
+			"request_id", reqID.String())
 	case errors.Is(err, context.Canceled):
-		p.logger.Debugw("Proxy request was cancelled.")
+		p.logger.Debugw("Proxy request was cancelled.",
+			"request_id", reqID.String())
 	}
 
+	w.Header().Set(reqid.HeaderName, reqID.String())
 	w.WriteHeader(http.StatusBadGateway)
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/dstotijn/hetty/pkg/filter"
 	"github.com/dstotijn/hetty/pkg/log"
 	"github.com/dstotijn/hetty/pkg/proxy"
+	"github.com/dstotijn/hetty/pkg/reqid"
 )
 
 var (
@@ -123,7 +124,7 @@ func (svc *Service) RequestModifier(next proxy.RequestModifyFunc) proxy.RequestM
 // InterceptRequest adds an HTTP request to an array of pending intercepted requests, alongside channels used for
 // sending a cancellation signal and receiving a modified request. It's safe for concurrent use.
 func (svc *Service) InterceptRequest(ctx context.Context, req *http.Request) (*http.Request, error) {
-	reqID, ok := proxy.RequestIDFromContext(ctx)
+	reqID, ok := reqid.FromContext(ctx)
 	if !ok {
 		svc.logger.Errorw("Failed to intercept: context doesn't have an ID.")
 		return req, nil
@@ -358,7 +359,7 @@ func (svc *Service) ResponseModifier(next proxy.ResponseModifyFunc) proxy.Respon
 // InterceptResponse adds an HTTP response to an array of pending intercepted responses, alongside channels used for
 // sending a cancellation signal and receiving a modified response. It's safe for concurrent use.
 func (svc *Service) InterceptResponse(ctx context.Context, res *http.Response) (*http.Response, error) {
-	reqID, ok := proxy.RequestIDFromContext(ctx)
+	reqID, ok := reqid.FromContext(ctx)
 	if !ok {
 		svc.logger.Errorw("Failed to intercept: context doesn't have an ID.")
 		return res, nil

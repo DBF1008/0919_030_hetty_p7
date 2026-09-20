@@ -16,7 +16,7 @@ import (
 
 	"github.com/dstotijn/hetty/pkg/db/bolt"
 	"github.com/dstotijn/hetty/pkg/proj"
-	"github.com/dstotijn/hetty/pkg/proxy"
+	"github.com/dstotijn/hetty/pkg/reqid"
 	"github.com/dstotijn/hetty/pkg/reqlog"
 	"github.com/dstotijn/hetty/pkg/scope"
 )
@@ -59,7 +59,7 @@ func TestRequestModifier(t *testing.T) {
 	reqModFn := svc.RequestModifier(next)
 	req := httptest.NewRequest("GET", "https://example.com/", strings.NewReader("bar"))
 	reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
-	req = req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+	req = req.WithContext(reqid.ContextWithID(req.Context(), reqID))
 
 	reqModFn(req)
 
